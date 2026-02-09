@@ -26,6 +26,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const voiceBtn = document.getElementById('voice-btn');
     const historyList = document.getElementById('history-list');
 
+    // Chat Elements
+    const chatMessages = document.getElementById('chat-messages');
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const chatSendBtn = document.getElementById('chat-send-btn');
+    let chatChannel = null;
+
     // --- Helper Functions ---
     // (Must be defined before they are used in updateAuthUI)
 
@@ -97,6 +104,160 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
+    // Chat Functions
+    const fetchChatMessages = async () => {
+        try {
+            const { data: { session } } = await supabaseClient.auth.getSession();
+            if (!session) return;
+
+            const response = await fetch('/api/chat', {
+                headers: {
+                    'Authorization': `Bearer ${session.access_token}`
+                }
+            });
+
+            if (!response.ok) throw new Error('Failed to fetch chat messages');
+
+            const data = await response.json();
+            const messages = data.messages || [];
+
+            renderChatMessages(messages, session.user.email);
+        } catch (error) {
+            console.error('Error fetching chat messages:', error);
+        }
+    };
+
+    const renderChatMessages = (messages, userEmail) => {
+        if (messages.length === 0) {
+            chatMessages.innerHTML = '<div class="chat-placeholder">아직 메시지가 없습니다. 첫 대화를 시작해보세요!</div>';
+            return;
+        }
+
+        chatMessages.innerHTML = messages.map(msg => {
+            const isMine = msg.user_email === userEmail;
+            const senderName = isMine ? '나' : (msg.user_email ? msg.user_email.split('@')[0] : '익명');
+            const messageClass = isMine ? 'message-mine' : 'message-others';
+
+            return `
+                <div class="message ${messageClass}">
+                    <span class="message-sender">${senderName}</span>
+                    <div class="message-content">${msg.content}</div>
+                </div>
+            `;
+        }).join('');
+
+        // Scroll to bottom
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    };
+
+    const addMessageToChat = (msg, userEmail) => {
+        // Remove placeholder if exists
+        const placeholder = chatMessages.querySelector('.chat-placeholder');
+        if (placeholder) {
+            chatMessages.innerHTML = '';
+        }
+
+        const isMine = msg.user_email === userEmail;
+        const senderName = isMine ? '나' : (msg.user_email ? msg.user_email.split('@')[0] : '익명');
+        const messageClass = isMine ? 'message-mine' : 'message-others';
+
+        const messageEl = document.createElement('div');
+        messageEl.className = `message ${messageClass}`;
+        messageEl.innerHTML = `
+            <span class="message-sender">${senderName}</span>
+            <div class="message-content">${msg.content}</div>
+        `;
+
+        chatMessages.appendChild(messageEl);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    };
+
+    const setupRealtimeChat = async () => {
+        const { data: { session } } = await supabaseClient.auth.getSession();
+        if (!session) return;
+
+        // Unsubscribe from previous channel if exists
+        if (chatChannel) {
+            await supabaseClient.removeChannel(chatChannel);
+            chatChannel = null;
+        }
+
+        // Create new channel and subscribe to INSERT events
+        chatChannel = supabaseClient
+            .channel('messages')
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'messages'
+                },
+                (payload) => {
+                    console.log('New message received:', payload);
+                    addMessageToChat(payload.new, session.user.email);
+                }
+            )
+            .subscribe((status) => {
+                console.log('Realtime subscription status:', status);
+            });
+
+        // Load existing messages
+        await fetchChatMessages();
+    };
+
+    const cleanupRealtimeChat = async () => {
+        if (chatChannel) {
+            await supabaseClient.removeChannel(chatChannel);
+            chatChannel = null;
+        }
+    };
+
+    const sendChatMessage = async (e) => {
+        e.preventDefault();
+        const content = chatInput.value.trim();
+        if (!content) return;
+
+        try {
+            const { data: { session } } = await supabaseClient.auth.getSession();
+            if (!session) {
+                alert('로그인이 필요합니다.');
+                return;
+            }
+
+            // Immediately clear input and disable temporary
+            chatSendBtn.disabled = true;
+
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${session.access_token}`
+                },
+                body: JSON.stringify({ content })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || '메시지 전송 실패');
+            }
+
+            // Clear input on success
+            chatInput.value = '';
+
+            // No need to manually refresh - real-time subscription will handle it
+
+        } catch (error) {
+            console.error('Error sending message:', error);
+            alert('메시지 전송에 실패했습니다: ' + error.message);
+        } finally {
+            chatSendBtn.disabled = false;
+            chatInput.focus();
+        }
+    };
+
+    // Chat Event Listeners
+    chatForm.addEventListener('submit', sendChatMessage);
+
     const loadSavedData = () => {
         // TODO: In the future, this should load from Supabase per user
         const savedDiary = localStorage.getItem('last_diary');
@@ -129,6 +290,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Load user data when logged in
             loadSavedData();
             fetchHistory();
+
+            // Start Real-time Chat
+            setupRealtimeChat();
         } else {
             // Logged out
             loginSection.classList.remove('hidden');
@@ -141,6 +305,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             diaryInput.value = '';
             responseText.textContent = '여기에 AI의 답변이 표시됩니다.';
             historyList.innerHTML = '<div class="loading-spinner">히스토리를 불러오는 중...</div>';
+
+            // Stop Real-time Chat
+            cleanupRealtimeChat();
+            chatMessages.innerHTML = '';
         }
     };
 
